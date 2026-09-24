@@ -1302,8 +1302,11 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
       （不允许空白 / Infinity / NaN；下界不得大于上界），解析失败者
       单独列入 invalid 并注明原因；从未揭示的承诺单独计数；
     - 覆盖判定为闭区间（下界 <= 标准结果 <= 上界），用 decimal.Decimal
-      精确计算，不经过浮点；区间宽度 = 上界 - 下界，同为精确十进制；
-    - 命中者按 (区间宽度, 承诺提交时间, 承诺 ID) 升序排名（rank 从 1
+      精确比较，不经过浮点、不经上下文精度舍入；区间宽度 = 上界 - 下界
+      由整数系数运算得出无舍入精确值（默认 Decimal 精度会截断超过 28 位
+      的合法宽度，导致丢末位与排名反转），宽度超过 4096 位有效数字时
+      返回 422 INTERVAL_WIDTH_TOO_MANY_DIGITS，不静默舍入；
+    - 命中者按 (区间真实宽度, 承诺提交时间, 承诺 ID) 升序排名（rank 从 1
       开始）；未命中者按 (承诺提交时间, 承诺 ID) 列出但不排名
       （rank 为 null）；
     - 响应回显结算时固化的 correct / incorrect / unrevealed 计数，
@@ -1341,7 +1344,18 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
         if reveal is not None
     ]
     unrevealed_count = sum(1 for _, reveal in rows if reveal is None)
-    report = intervals.build_interval_report(standard, revealed, unrevealed_count)
+    try:
+        report = intervals.build_interval_report(standard, revealed, unrevealed_count)
+    except intervals.IntervalWidthTooLargeError as exc:
+        # 精确宽度有效位数超过 4096：明确拒绝，不做静默舍入，也不让超长
+        # 宽度渲染 / 巨型整数运算冒泡成 500
+        raise api_error(
+            422,
+            "INTERVAL_WIDTH_TOO_MANY_DIGITS",
+            f"承诺 {exc.commitment_id} 的揭示原文 {exc.lower_text}..{exc.upper_text} "
+            f"对应的区间精确宽度有 {exc.digit_count} 位有效数字，"
+            f"超过 {intervals.MAX_WIDTH_DIGITS} 位上限，无法生成数值区间报告",
+        )
 
     def entry_out(entry: intervals.IntervalEntry, rank: int | None) -> IntervalReportEntryOut:
         return IntervalReportEntryOut(

@@ -6,6 +6,12 @@ SQLite 文件库 + 模拟时钟，覆盖：
   - 区间解析：合法 / 非法格式 / 下界大于上界；未揭示承诺单独计数
   - 十进制精确覆盖判定：闭区间边界命中、数值相等（1.10 == 1.1）、
     宽度精确（0.2 而非浮点误差）
+  - **无舍入宽度**：超过默认 Decimal 28 位精度的合法端点（如 30 位
+    端点）宽度保留末位、互不塌缩；命中者按真实宽度排名，较宽者不会
+    因舍入被排到较窄者之前
+  - 精确宽度系数超过 4096 位返回 422 INTERVAL_WIDTH_TOO_MANY_DIGITS
+    （边界 4096 接受 / 4097 拒绝；短输入但指数差巨大同样快速拒绝），
+    不静默舍入、不冒泡 500
   - 命中者按宽度升序排名，同宽按承诺提交时间、承诺 ID 排序
   - 未命中者列出但不排名（rank 为 null）
   - 既有结算计数不变；接口只读，重复调用结果一致
@@ -262,6 +268,136 @@ def test_scientific_notation_bounds_are_finite_decimals():
     assert body["miss_count"] == 1
 
 
+# 超过默认 Decimal 上下文精度（28 位有效数字）的端点：宽度必须保留末位
+LONG_WIDE = "0.123456789012345678901234567891"   # 30 位，较宽
+LONG_NARROW = "0.123456789012345678901234567890"  # 30 位，较窄（差末位 1e-30）
+
+
+def test_width_beyond_default_decimal_precision_keeps_last_digit():
+    # 默认 Decimal 精度（28 位）下两个宽度都会被舍成同一个
+    # 0.1234567890123456789012345679：修复后必须各自保留真实末位
+    from decimal import Decimal, localcontext
+    with localcontext() as ctx:
+        ctx.prec = 28
+        assert Decimal(LONG_WIDE) - Decimal("0") == Decimal(LONG_NARROW) - Decimal("0")
+
+    event_id = create_event()
+    id_wide = commit(event_id, f"0..{LONG_WIDE}", "s-long-wide")
+    id_narrow = commit(event_id, f"0..{LONG_NARROW}", "s-long-narrow")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, f"0..{LONG_WIDE}", "s-long-wide")
+    reveal(event_id, f"0..{LONG_NARROW}", "s-long-narrow")
+
+    clock.t = REVEAL_DL
+    settle(event_id, "0.0001")  # 两个区间都覆盖
+
+    body = report(event_id)
+    hits_by_id = {h["commitment_id"]: h for h in body["hits"]}
+    # 宽度逐字保留末位，不再塌缩
+    assert hits_by_id[id_wide]["width"] == LONG_WIDE
+    assert hits_by_id[id_narrow]["width"] == LONG_NARROW
+    # 真实宽度升序：较窄者（末位 0）排第 1，较宽者（末位 1）排第 2，
+    # 不会因默认精度舍入而把较宽区间排到较窄者之前
+    assert [h["commitment_id"] for h in body["hits"]] == [id_narrow, id_wide]
+    assert hits_by_id[id_narrow]["rank"] == 1
+    assert hits_by_id[id_wide]["rank"] == 2
+    assert body["hit_count"] == 2
+
+
+def test_30_digit_standard_coverage_is_exact():
+    # 标准结果本身超过默认精度：仅末位为 1 的区间覆盖，末位为 0 的不覆盖
+    event_id = create_event()
+    commit(event_id, f"0..{LONG_WIDE}", "s-long-wide")
+    commit(event_id, f"0..{LONG_NARROW}", "s-long-narrow")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, f"0..{LONG_WIDE}", "s-long-wide")
+    reveal(event_id, f"0..{LONG_NARROW}", "s-long-narrow")
+
+    clock.t = REVEAL_DL
+    settle(event_id, LONG_WIDE)
+
+    body = report(event_id)
+    assert body["standard_result"] == LONG_WIDE
+    assert body["hit_count"] == 1
+    assert body["miss_count"] == 1
+    assert body["hits"][0]["upper_bound"] == LONG_WIDE
+    assert body["misses"][0]["upper_bound"] == LONG_NARROW
+    assert body["hits"][0]["width"] == LONG_WIDE
+
+
+def test_width_with_4096_digits_is_accepted():
+    # 边界：恰好 4096 位有效数字的宽度正常返回（纯十进制小数，宽度同位数）
+    bound_4096 = "0." + "1" * 4096
+    event_id = create_event()
+    commit(event_id, f"0..{bound_4096}", "s-4096")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, f"0..{bound_4096}", "s-4096")
+
+    clock.t = REVEAL_DL
+    settle(event_id, "0.0001")
+
+    body = report(event_id)
+    assert body["hit_count"] == 1
+    assert body["hits"][0]["width"] == bound_4096
+    assert len(body["hits"][0]["width"].replace("0.", "")) == 4096
+
+
+def test_width_with_4097_digits_returns_422():
+    # 超过 4096 位：明确 422，不静默舍入
+    bound_4097 = "0." + "1" * 4097
+    event_id = create_event()
+    cid = commit(event_id, f"0..{bound_4097}", "s-4097")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, f"0..{bound_4097}", "s-4097")
+
+    clock.t = REVEAL_DL
+    settle(event_id, "0.0001")
+
+    body = report(event_id, expected=422)
+    assert body["detail"]["code"] == "INTERVAL_WIDTH_TOO_MANY_DIGITS"
+    assert cid in body["detail"]["message"]
+    # 拒绝不改变任何结算数据
+    r = client.get(f"/events/{event_id}/settlement")
+    assert r.json()["status"] == "settled"
+
+
+def test_oversize_width_in_miss_also_returns_422():
+    # 超长宽度区间即使不覆盖标准结果（列入 misses）也整体拒绝，
+    # 不做静默舍入后照常出报告
+    bound_4097 = "0." + "1" * 4097
+    event_id = create_event()
+    commit(event_id, f"0..{bound_4097}", "s-miss-wide")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, f"0..{bound_4097}", "s-miss-wide")
+
+    clock.t = REVEAL_DL
+    settle(event_id, "5")  # 区间 [0, 0.111…] 不覆盖
+
+    body = report(event_id, expected=422)
+    assert body["detail"]["code"] == "INTERVAL_WIDTH_TOO_MANY_DIGITS"
+
+
+def test_huge_exponent_gap_short_input_returns_422_fast():
+    # 短原文但指数差巨大（-1..1e999999999）：宽度系数近 10 亿位，
+    # 结构预判直接 422，不构造巨型整数、不冒泡 500
+    event_id = create_event()
+    commit(event_id, "-1..1e999999999", "s-huge-gap")
+
+    clock.t = COMMIT_DL
+    reveal(event_id, "-1..1e999999999", "s-huge-gap")
+
+    clock.t = REVEAL_DL
+    settle(event_id, "0")
+
+    body = report(event_id, expected=422)
+    assert body["detail"]["code"] == "INTERVAL_WIDTH_TOO_MANY_DIGITS"
+
+
 def test_invalid_format_variants():
     event_id = create_event()
     texts = [
@@ -358,3 +494,118 @@ def test_parse_interval_bounds_and_reasons():
     for bad in ["", "1", "1..2..3", "a..2", "1...2.5.6", "..", "1 .. 2"]:
         parsed, reason = intervals.parse_interval(bad)
         assert parsed is None and reason == intervals.INVALID_FORMAT, bad
+
+
+# --------------------------------------------------------------------------- #
+# 纯函数：无舍入宽度计算（不依赖 Decimal 上下文精度）
+# --------------------------------------------------------------------------- #
+
+def _infinite_precision_width(upper_text: str, lower_text: str) -> Decimal:
+    """无限精度 Decimal 算术的参考实现（高上下文精度 + 大 Emax/Emin）。"""
+    from decimal import localcontext
+    with localcontext() as ctx:
+        ctx.prec = 10_000_000
+        ctx.Emax = 999_999_999
+        ctx.Emin = -999_999_999
+        return Decimal(upper_text) - Decimal(lower_text)
+
+
+def test_exact_width_independent_of_context_precision():
+    # 在极低上下文精度下调用，结果仍与无限精度算术逐元组一致
+    from decimal import localcontext
+    pairs = [
+        ("0.123456789012345678901234567891", "0"),
+        ("0.123456789012345678901234567890", "0"),
+        ("1.6", "1.4"), ("2.00", "2.0"), ("0.30", "0.10"),
+        ("5", "-5"), ("2e2", "1e2"),
+        ("1", "0.999999999999999999999999999999"),
+        ("1.0000000000000000000000000000001", "1.0000000000000000000000000000000"),
+        ("-0.9", "-0.999999999999999999999999999999"),
+    ]
+    with localcontext() as ctx:
+        ctx.prec = 2  # 极端低精度也不影响精确宽度
+        for upper_text, lower_text in pairs:
+            got = intervals.exact_decimal_difference(
+                Decimal(upper_text), Decimal(lower_text)
+            )
+            expected = _infinite_precision_width(upper_text, lower_text)
+            assert got == expected, (upper_text, lower_text, got, expected)
+            assert got.as_tuple() == expected.as_tuple(), (upper_text, lower_text)
+
+
+def test_exact_width_natural_representation_preserved():
+    # 与无限精度 Decimal 算术的自然表示一致（保留操作数尾随 0）
+    assert str(intervals.exact_decimal_difference(Decimal("10"), Decimal("0"))) == "10"
+    assert str(intervals.exact_decimal_difference(Decimal("2.00"), Decimal("2.0"))) == "0.00"
+    assert str(intervals.exact_decimal_difference(Decimal("2.50"), Decimal("1.5"))) == "1.00"
+    assert intervals.exact_decimal_difference(Decimal("2e2"), Decimal("1e2")) == Decimal("1E+2")
+
+
+def test_distinct_30_digit_widths_do_not_collapse():
+    # 回归：默认 28 位精度下两宽度相等；修复后严格可分、较宽者更大
+    wide, _ = intervals.parse_interval(f"0..0.123456789012345678901234567891")
+    narrow, _ = intervals.parse_interval(f"0..0.123456789012345678901234567890")
+    assert wide.width != narrow.width
+    assert wide.width > narrow.width
+    assert str(wide.width) == "0.123456789012345678901234567891"
+    assert str(narrow.width) == "0.123456789012345678901234567890"
+
+
+def test_exact_width_4096_boundary_and_rejection():
+    accepted = "0." + "1" * intervals.MAX_WIDTH_DIGITS
+    parsed, reason = intervals.parse_interval(f"0..{accepted}")
+    assert reason is None
+    assert len(parsed.width.as_tuple().digits) == intervals.MAX_WIDTH_DIGITS
+
+    rejected = "0." + "1" * (intervals.MAX_WIDTH_DIGITS + 1)
+    with pytest.raises(intervals.IntervalWidthTooLargeError) as exc_info:
+        intervals.parse_interval(f"0..{rejected}")
+    assert exc_info.value.digit_count == intervals.MAX_WIDTH_DIGITS + 1
+
+
+def test_exact_width_huge_exponent_gap_rejected_without_giant_integer():
+    # -1..1e999999999：宽度系数近 10 亿位，结构预判快速拒绝（毫秒级）
+    import time
+    start = time.monotonic()
+    with pytest.raises(intervals.IntervalWidthTooLargeError) as exc_info:
+        intervals.parse_interval("-1..1e999999999")
+    assert time.monotonic() - start < 5
+    assert exc_info.value.digit_count > intervals.MAX_WIDTH_DIGITS
+
+    # 另一侧指数方向（0..1e999999999 同样超宽）
+    with pytest.raises(intervals.IntervalWidthTooLargeError):
+        intervals.parse_interval("0..1e999999999")
+
+
+def test_exact_width_matches_infinite_precision_on_random_pairs():
+    # 随机合法（upper >= lower）十进制对：结果逐元组等于无限精度算术
+    import random
+    rng = random.Random(20260924)
+
+    def rand_decimal_text() -> str:
+        sign = rng.choice(["", "", "-"])
+        n_int = rng.randint(0, 4)
+        n_frac = rng.randint(0, 4)
+        if n_int == 0 and n_frac == 0:
+            n_int = 1
+        int_part = "".join(rng.choice("0123456789") for _ in range(n_int)) or "0"
+        frac_part = "".join(rng.choice("0123456789") for _ in range(n_frac))
+        text = sign + int_part + ("." + frac_part if n_frac else "")
+        if rng.random() < 0.3:
+            text += "e" + rng.choice(["", "-", "+"]) + str(rng.randint(0, 4))
+        return text
+
+    checked = 0
+    while checked < 2000:
+        upper_text, lower_text = rand_decimal_text(), rand_decimal_text()
+        upper, lower = Decimal(upper_text), Decimal(lower_text)
+        if upper < lower:
+            continue
+        got = intervals.exact_decimal_difference(upper, lower)
+        expected = _infinite_precision_width(upper_text, lower_text)
+        if expected == 0:
+            # 跨指数的 -0 符号位为展示细节，只校验数值
+            assert got == 0
+        else:
+            assert got.as_tuple() == expected.as_tuple(), (upper_text, lower_text)
+        checked += 1
