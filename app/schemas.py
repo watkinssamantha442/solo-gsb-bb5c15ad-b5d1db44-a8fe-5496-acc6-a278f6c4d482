@@ -191,7 +191,7 @@ class IntervalReportEntryOut(BaseModel):
     committed_at: datetime = Field(description="承诺提交时间（UTC），同宽时的排名依据之一")
     lower_bound: str = Field(description="原文中的下界片段（逐字保留）")
     upper_bound: str = Field(description="原文中的上界片段（逐字保留）")
-    width: str = Field(description="区间宽度（上界 - 下界）的精确十进制表示")
+    width: str = Field(description="区间宽度（上界 - 下界）的精确十进制表示（整数系数精确运算，无舍入；超过 4096 位时整份报告返回 422）")
     hit: bool = Field(description="区间是否覆盖标准结果（闭区间，十进制精确判定）")
     rank: Optional[int] = Field(
         description="命中者名次（从 1 开始，按宽度升序，同宽按承诺提交时间、承诺 ID）；未命中为 null"

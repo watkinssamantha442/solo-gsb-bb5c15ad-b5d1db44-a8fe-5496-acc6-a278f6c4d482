@@ -1302,10 +1302,14 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
       （不允许空白 / Infinity / NaN；下界不得大于上界），解析失败者
       单独列入 invalid 并注明原因；从未揭示的承诺单独计数；
     - 覆盖判定为闭区间（下界 <= 标准结果 <= 上界），用 decimal.Decimal
-      精确计算，不经过浮点；区间宽度 = 上界 - 下界，同为精确十进制；
-    - 命中者按 (区间宽度, 承诺提交时间, 承诺 ID) 升序排名（rank 从 1
+      精确计算，不经过浮点；区间宽度 = 上界 - 下界，用整数系数运算
+      精确求得（不受默认 Decimal 28 位精度影响，末位不丢）；
+    - 命中者按 (真实区间宽度, 承诺提交时间, 承诺 ID) 升序排名（rank 从 1
       开始）；未命中者按 (承诺提交时间, 承诺 ID) 列出但不排名
       （rank 为 null）；
+    - 任一合法区间的精确宽度有效数字位数超过
+      intervals.MAX_WIDTH_DIGITS（4096）时，整份报告返回
+      422 INTERVAL_WIDTH_TOO_LARGE，不静默舍入也不返回 500；
     - 响应回显结算时固化的 correct / incorrect / unrevealed 计数，
       既有结算结果不被本接口修改。
     """
@@ -1341,7 +1345,18 @@ def get_interval_report(event_id: UUID, db: Session = Depends(get_db)):
         if reveal is not None
     ]
     unrevealed_count = sum(1 for _, reveal in rows if reveal is None)
-    report = intervals.build_interval_report(standard, revealed, unrevealed_count)
+    try:
+        report = intervals.build_interval_report(standard, revealed, unrevealed_count)
+    except intervals.WidthTooLargeError:
+        # 区间合法但精确宽度位数超过 4096：明确拒绝，绝不静默舍入，
+        # 也避免在指数跨度过大时物化超大整数导致 500
+        raise api_error(
+            422,
+            "INTERVAL_WIDTH_TOO_LARGE",
+            "存在精确宽度有效数字位数超过 "
+            f"{intervals.MAX_WIDTH_DIGITS} 位的合法区间，无法在不舍入的前提下"
+            "生成数值区间报告",
+        )
 
     def entry_out(entry: intervals.IntervalEntry, rank: int | None) -> IntervalReportEntryOut:
         return IntervalReportEntryOut(
